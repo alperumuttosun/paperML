@@ -5957,6 +5957,503 @@ for (m in unique(final_results$model)) {
 
 
 
+# ============================================================
+# STEP 11 - NRMSE robustness check (GPT suggestion #4)
+# ============================================================
+# Goal: check whether the pooled Figure 1a learning curve (raw RMSE)
+# is driven by high-variance crops like maize/rice dominating the pool.
+# NRMSE = RMSE / SD(yield for that crop) puts every crop on a comparable
+# scale before pooling. If the NRMSE learning curve shows the same
+# declining, diminishing-returns pattern as the raw RMSE one, that
+# confirms the pooled result isn't just a scale artifact.
+#
+# Uses the already-computed climate+GDP results file - no new model
+# fitting, this is pure re-analysis of existing results plus one new
+# ingredient: each crop's yield standard deviation (computed once from
+# the raw panel data).
+
+if (!require("readxl")) install.packages("readxl")
+library(readxl)
+
+data_dir   <- "C:/Users/Alper.Tosun/Desktop/cru130"
+output_dir <- "C:/Users/Alper.Tosun/Desktop/pamuk/mlpaper"
+
+# --- Step 1: compute each crop's yield standard deviation (for NRMSE denominator) ---
+crops <- c("wheat", "barley", "oats", "rye", "rice", "maize", "soybean", "sorghum")
+yield_sd <- data.frame(crop = character(), sd_yield = numeric())
+
+for (crop_name in crops) {
+  f <- file.path(data_dir, paste0("panelv7_", crop_name, ".xlsx"))
+  df <- read_excel(f)
+  yield_sd <- rbind(yield_sd, data.frame(
+    crop = crop_name,
+    sd_yield = sd(df$yield_hg_per_ha, na.rm = TRUE)
+  ))
+}
+
+cat("==== Yield SD by crop (NRMSE denominator) ====\n")
+print(yield_sd)
+
+# --- Step 2: load the full climate+GDP results and merge with yield_sd ---
+cat("\nLoading full climate+GDP results (~1M rows)...\n")
+results <- read.csv(file.path(output_dir, "step4_FULL_climate_gdp_results.csv"))
+results_valid <- results[!is.na(results$rmse), ]
+
+results_valid <- merge(results_valid, yield_sd, by = "crop")
+results_valid$nrmse <- results_valid$rmse / results_valid$sd_yield
+
+cat("Merged rows:", nrow(results_valid), "\n\n")
+
+# --- Step 3: pooled learning curve, RAW RMSE (same as existing Figure 1a) ---
+cat("==== Pooled RAW RMSE by N (existing Figure 1a numbers, for comparison) ====\n")
+raw_by_n <- aggregate(rmse ~ N, data = results_valid, FUN = median)
+print(raw_by_n)
+
+# --- Step 4: pooled learning curve, NRMSE (the new robustness check) ---
+cat("\n==== Pooled NRMSE by N (new scale-normalized check) ====\n")
+nrmse_by_n <- aggregate(nrmse ~ N, data = results_valid, FUN = median)
+nrmse_by_n$nrmse <- round(nrmse_by_n$nrmse, 4)
+print(nrmse_by_n)
+
+nrmse_iqr <- aggregate(nrmse ~ N, data = results_valid,
+                        FUN = function(x) c(q25 = quantile(x, 0.25), q75 = quantile(x, 0.75)))
+nrmse_iqr_flat <- do.call(data.frame, nrmse_iqr)
+names(nrmse_iqr_flat) <- c("N", "q25_nrmse", "q75_nrmse")
+nrmse_full <- merge(nrmse_by_n, nrmse_iqr_flat, by = "N")
+nrmse_full <- nrmse_full[order(nrmse_full$N), ]
+
+cat("\n==== Full NRMSE summary table (median, IQR) ====\n")
+print(nrmse_full)
+
+# --- Step 5: check - does NRMSE show the same declining/diminishing pattern? ---
+cat("\n==== Percent reduction, N=5 to N=60 ====\n")
+raw_reduction <- 100 * (raw_by_n$rmse[raw_by_n$N==5] - raw_by_n$rmse[raw_by_n$N==60]) / raw_by_n$rmse[raw_by_n$N==5]
+nrmse_reduction <- 100 * (nrmse_by_n$nrmse[nrmse_by_n$N==5] - nrmse_by_n$nrmse[nrmse_by_n$N==60]) / nrmse_by_n$nrmse[nrmse_by_n$N==5]
+cat("Raw RMSE reduction:", round(raw_reduction, 1), "%\n")
+cat("NRMSE reduction:", round(nrmse_reduction, 1), "%\n")
+
+# --- Save results ---
+write.csv(nrmse_full, file.path(output_dir, "step11_NRMSE_pooled_summary.csv"), row.names = FALSE)
+write.csv(yield_sd, file.path(output_dir, "step11_yield_sd_by_crop.csv"), row.names = FALSE)
+cat("\nSaved: step11_NRMSE_pooled_summary.csv and step11_yield_sd_by_crop.csv\n")
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# STEP 12 PILOT - Temporal leakage robustness check
+# Wheat + Maize, LM only - detrended yield vs raw yield
+# ============================================================
+# Goal: does the source-country learning curve (RMSE declining as N
+# increases) survive if we remove each country's own linear time trend
+# from yield before running the analysis? If yes, the main result is not
+# just picking up a shared secular trend (technology, breeding, etc.)
+# across countries and years.
+#
+# Method: for each country, fit yield ~ year (a simple linear regression)
+# and keep the RESIDUALS (the part of yield not explained by that
+# country's own linear trend over time). Re-run the exact same
+# source-country sampling design (same seeds, same N values, same
+# replicate count) on these residuals instead of raw yield, using LM only,
+# for wheat and maize only (a fast pilot, not the full 8-crop x 5-model
+# design).
+#
+# No detrending of climate/GDP predictors - only the yield (outcome)
+# variable is detrended, since that is what "the model is just learning
+# a shared time trend" would mean.
+
+if (!require("readxl")) install.packages("readxl")
+library(readxl)
+
+data_dir   <- "C:/Users/Alper.Tosun/Desktop/cru130"
+output_dir <- "C:/Users/Alper.Tosun/Desktop/pamuk/mlpaper"
+
+pilot_crops  <- c("wheat", "maize")
+source_sizes <- c(5, 10, 20, 40, 60)
+n_replicates <- 50   # same as the main design, for a fair comparison
+
+predictor_cols <- c("TMP_ann", "TMX_ann", "TMN_ann", "PRE_ann", "GDP_per_Capita")
+target_col <- "yield_hg_per_ha"
+
+standardize_with_train_stats <- function(train_df, test_df, cols) {
+  train_means <- sapply(train_df[, cols], mean, na.rm = TRUE)
+  train_sds   <- sapply(train_df[, cols], sd, na.rm = TRUE)
+  for (col in cols) {
+    train_df[[col]] <- (train_df[[col]] - train_means[col]) / train_sds[col]
+    test_df[[col]]  <- (test_df[[col]]  - train_means[col]) / train_sds[col]
+  }
+  list(train = train_df, test = test_df)
+}
+
+fit_lm_rmse <- function(source_countries, target_country, data, y_col) {
+  train_df <- data[data$Country_ISO %in% source_countries, ]
+  test_df  <- data[data$Country_ISO == target_country, ]
+  needed_cols <- c(predictor_cols, y_col)
+  train_df <- train_df[complete.cases(train_df[, needed_cols]), ]
+  test_df  <- test_df[complete.cases(test_df[, needed_cols]), ]
+
+  if (nrow(train_df) < 10 || nrow(test_df) < 1) return(NA)
+
+  scaled <- standardize_with_train_stats(train_df, test_df, predictor_cols)
+  formula_str <- paste(y_col, "~", paste(predictor_cols, collapse = " + "))
+  model <- lm(as.formula(formula_str), data = scaled$train)
+  preds <- predict(model, newdata = scaled$test)
+  sqrt(mean((preds - scaled$test[[y_col]])^2))
+}
+
+overall_start <- Sys.time()
+all_pilot_results <- list()
+
+for (crop_name in pilot_crops) {
+
+  cat("\n\n========== CROP:", crop_name, "==========\n")
+  crop_file <- file.path(data_dir, paste0("panelv7_", crop_name, ".xlsx"))
+  crop_data <- as.data.frame(read_excel(crop_file))
+
+  # --- Detrend: for each country, regress yield on year, keep residuals ---
+  cat("Detrending yield (country-specific linear time trend removed)...\n")
+  crop_data$yield_detrended <- NA_real_
+
+  for (iso in unique(crop_data$Country_ISO)) {
+    idx <- crop_data$Country_ISO == iso
+    sub <- crop_data[idx, ]
+    if (sum(!is.na(sub$yield_hg_per_ha)) < 5) next  # need enough points for a stable trend
+
+    trend_model <- lm(yield_hg_per_ha ~ Yil, data = sub)
+    crop_data$yield_detrended[idx] <- residuals(trend_model)[match(rownames(sub), names(residuals(trend_model)))]
+  }
+
+  n_detrended <- sum(!is.na(crop_data$yield_detrended))
+  cat("Detrended yield available for", n_detrended, "of", nrow(crop_data), "rows\n")
+
+  all_countries <- sort(unique(crop_data$Country_ISO))
+
+  # --- Run the SAME sampling design, twice: once on raw yield, once on detrended ---
+  for (y_col in c("yield_hg_per_ha", "yield_detrended")) {
+
+    cat("\n--- Target variable:", y_col, "---\n")
+    y_start <- Sys.time()
+
+    for (N in source_sizes) {
+      rmse_vals <- c()
+
+      for (target in all_countries) {
+        remaining <- setdiff(all_countries, target)
+        if (N > length(remaining)) next
+        target_idx <- which(all_countries == target)
+
+        for (r in 1:n_replicates) {
+          # SAME seed formula as the main design, so source-country draws
+          # are identical to those already used in step4_FULL_climate_gdp.R
+          set.seed(10000 * target_idx + 100 * N + r)
+          source_set <- sample(remaining, size = N, replace = FALSE)
+
+          rmse_val <- fit_lm_rmse(source_set, target, crop_data, y_col)
+          if (!is.na(rmse_val)) rmse_vals <- c(rmse_vals, rmse_val)
+        }
+      }
+
+      all_pilot_results[[paste(crop_name, y_col, N, sep = "_")]] <- data.frame(
+        crop = crop_name, target_variable = y_col, N = N,
+        median_rmse = median(rmse_vals, na.rm = TRUE),
+        q25_rmse = quantile(rmse_vals, 0.25, na.rm = TRUE),
+        q75_rmse = quantile(rmse_vals, 0.75, na.rm = TRUE),
+        n_obs = length(rmse_vals)
+      )
+
+      cat("  N =", N, ": median RMSE =", round(median(rmse_vals, na.rm = TRUE), 1),
+          " (n =", length(rmse_vals), ")\n")
+    }
+
+    y_elapsed <- as.numeric(difftime(Sys.time(), y_start, units = "mins"))
+    cat("  [", round(y_elapsed, 1), "min for this target variable]\n")
+  }
+}
+
+total_elapsed <- as.numeric(difftime(Sys.time(), overall_start, units = "mins"))
+cat("\n\nTOTAL PILOT TIME:", round(total_elapsed, 1), "minutes\n")
+
+pilot_df <- do.call(rbind, all_pilot_results)
+rownames(pilot_df) <- NULL
+
+cat("\n==== FULL PILOT RESULTS TABLE ====\n")
+print(pilot_df)
+
+write.csv(pilot_df, file.path(output_dir, "step12_temporal_leakage_pilot.csv"), row.names = FALSE)
+cat("\nSaved to: step12_temporal_leakage_pilot.csv\n")
+
+# --- Quick check: does the declining pattern survive detrending? ---
+cat("\n\n==== KEY CHECK: does RMSE still decline with N after detrending? ====\n")
+for (crop_name in pilot_crops) {
+  for (y_col in c("yield_hg_per_ha", "yield_detrended")) {
+    sub <- pilot_df[pilot_df$crop == crop_name & pilot_df$target_variable == y_col, ]
+    sub <- sub[order(sub$N), ]
+    pct_change <- 100 * (sub$median_rmse[1] - sub$median_rmse[nrow(sub)]) / sub$median_rmse[1]
+    cat(crop_name, "-", y_col, ": N=5 RMSE =", round(sub$median_rmse[1], 1),
+        " -> N=60 RMSE =", round(sub$median_rmse[nrow(sub)], 1),
+        " (", round(pct_change, 1), "% reduction )\n")
+  }
+}
+
+
+
+
+
+
+# ============================================================
+# STEP 13 FULL RUN - Temporal-leakage robustness: DETRENDED yield
+# All 8 crops, 5 models, 50 replicates. Checkpointed and resumable.
+# ============================================================
+# EXACT SAME design as step4_FULL_climate_gdp.R (same N values, same
+# n_replicates=50, same seed formula, same 5 models, same checkpointing
+# logic, same predictors including GDP) - the ONLY difference is the
+# outcome variable: instead of raw yield_hg_per_ha, we use
+# yield_detrended, which is the residual from regressing each country's
+# own yield on year (removing that country's linear time trend before
+# the cross-country transfer analysis).
+#
+# This does NOT re-run the raw-yield analysis - that's already saved in
+# step4_FULL_climate_gdp_results.csv. This script only produces the
+# detrended-yield comparison.
+#
+# RESUMABLE: after each crop finishes, results are saved to a checkpoint
+# file. If interrupted, simply re-run this script - it skips crops that
+# already have a checkpoint and continues with the rest.
+#
+# Expected total time: ~15-30 hours (pilot on 2 crops x LM only took
+# ~20 minutes per crop per target-variable; scaling to 8 crops x 5
+# models, with GAM/RF/XGB slower than LM, gives this range).
+# ============================================================
+
+pkgs <- c("readxl", "glmnet", "mgcv", "randomForest", "xgboost")
+for (p in pkgs) {
+  if (!require(p, character.only = TRUE)) install.packages(p)
+  library(p, character.only = TRUE)
+}
+
+data_dir   <- "C:/Users/Alper.Tosun/Desktop/cru130"
+output_dir <- "C:/Users/Alper.Tosun/Desktop/pamuk/mlpaper"
+checkpoint_dir <- file.path(output_dir, "checkpoints_detrended")
+if (!dir.exists(checkpoint_dir)) dir.create(checkpoint_dir, recursive = TRUE)
+
+# --- SAME settings as the climate+GDP run ---
+all_crops <- c("wheat", "barley", "oats", "rye", "rice", "maize", "soybean", "sorghum")
+source_sizes <- c(5, 10, 20, 40, 60)
+n_replicates <- 50
+
+# --- SAME predictors as the climate+GDP run (GDP included) ---
+predictor_cols <- c("TMP_ann", "TMX_ann", "TMN_ann", "PRE_ann", "GDP_per_Capita")
+# --- ONLY DIFFERENCE from step4_FULL_climate_gdp.R: target is detrended yield ---
+target_col <- "yield_detrended"
+
+# ------------------------------------------------------------
+# HELPER FUNCTIONS (identical to the climate+GDP run)
+# ------------------------------------------------------------
+
+standardize_with_train_stats <- function(train_df, test_df, cols) {
+  train_means <- sapply(train_df[, cols], mean, na.rm = TRUE)
+  train_sds   <- sapply(train_df[, cols], sd, na.rm = TRUE)
+  for (col in cols) {
+    train_df[[col]] <- (train_df[[col]] - train_means[col]) / train_sds[col]
+    test_df[[col]]  <- (test_df[[col]]  - train_means[col]) / train_sds[col]
+  }
+  list(train = train_df, test = test_df)
+}
+
+prepare_train_test <- function(source_countries, target_country, data) {
+  train_df <- data[data$Country_ISO %in% source_countries, ]
+  test_df  <- data[data$Country_ISO == target_country, ]
+  needed_cols <- c(predictor_cols, target_col)
+  train_df <- train_df[complete.cases(train_df[, needed_cols]), ]
+  test_df  <- test_df[complete.cases(test_df[, needed_cols]), ]
+  list(train = train_df, test = test_df)
+}
+
+compute_metrics <- function(preds, actual) {
+  data.frame(rmse = sqrt(mean((preds - actual)^2)), mae = mean(abs(preds - actual)))
+}
+
+fit_lm <- function(train_df, test_df) {
+  formula_str <- paste(target_col, "~", paste(predictor_cols, collapse = " + "))
+  model <- lm(as.formula(formula_str), data = train_df)
+  predict(model, newdata = test_df)
+}
+
+fit_lasso <- function(train_df, test_df) {
+  x_train <- as.matrix(train_df[, predictor_cols]); y_train <- train_df[[target_col]]
+  x_test  <- as.matrix(test_df[, predictor_cols])
+  cv_model <- cv.glmnet(x_train, y_train, alpha = 1)
+  as.numeric(predict(cv_model, newx = x_test, s = "lambda.min"))
+}
+
+fit_gam <- function(train_df, test_df) {
+  formula_str <- paste(target_col, "~ s(TMP_ann) + s(TMX_ann) + s(TMN_ann) + s(PRE_ann) + s(GDP_per_Capita)")
+  model <- gam(as.formula(formula_str), data = train_df)
+  as.numeric(predict(model, newdata = test_df))
+}
+
+fit_rf <- function(train_df, test_df) {
+  formula_str <- paste(target_col, "~", paste(predictor_cols, collapse = " + "))
+  model <- randomForest(as.formula(formula_str), data = train_df, ntree = 100)
+  predict(model, newdata = test_df)
+}
+
+fit_xgb <- function(train_df, test_df) {
+  x_train <- as.matrix(data.frame(lapply(train_df[, predictor_cols], as.numeric)))
+  y_train <- as.numeric(train_df[[target_col]])
+  x_test  <- as.matrix(data.frame(lapply(test_df[, predictor_cols], as.numeric)))
+  model <- xgboost(x = x_train, y = y_train,
+                    nrounds = 100, max_depth = 4, learning_rate = 0.1,
+                    objective = "reg:squarederror")
+  as.numeric(predict(model, x_test))
+}
+
+model_fns <- list(LM = fit_lm, LASSO = fit_lasso, GAM = fit_gam, RF = fit_rf, XGB = fit_xgb)
+
+# ------------------------------------------------------------
+# Detrending function: for each country, regress yield on year,
+# keep residuals as the new outcome variable
+# ------------------------------------------------------------
+add_detrended_yield <- function(crop_data) {
+  crop_data$yield_detrended <- NA_real_
+  for (iso in unique(crop_data$Country_ISO)) {
+    idx <- crop_data$Country_ISO == iso
+    sub <- crop_data[idx, ]
+    if (sum(!is.na(sub$yield_hg_per_ha)) < 5) next
+    trend_model <- lm(yield_hg_per_ha ~ Yil, data = sub)
+    crop_data$yield_detrended[idx] <- residuals(trend_model)[match(rownames(sub), names(residuals(trend_model)))]
+  }
+  crop_data
+}
+
+# ------------------------------------------------------------
+# CHECKPOINT LOGIC
+# ------------------------------------------------------------
+already_done <- c()
+for (crop_name in all_crops) {
+  ckpt_file <- file.path(checkpoint_dir, paste0(crop_name, "_done.csv"))
+  if (file.exists(ckpt_file)) already_done <- c(already_done, crop_name)
+}
+if (length(already_done) > 0) {
+  cat("NOTE: found existing checkpoints for:", paste(already_done, collapse=", "), "\n")
+  cat("These crops will be SKIPPED. Delete their checkpoint files in\n")
+  cat(checkpoint_dir, "\nif you want to re-run them.\n\n")
+}
+crops_to_run <- setdiff(all_crops, already_done)
+
+# ------------------------------------------------------------
+# MAIN LOOP
+# ------------------------------------------------------------
+
+overall_start <- Sys.time()
+
+for (crop_name in crops_to_run) {
+
+  crop_start <- Sys.time()
+  cat("\n\n========== CROP:", crop_name, "started at", format(crop_start), "==========\n")
+
+  crop_file <- file.path(data_dir, paste0("panelv7_", crop_name, ".xlsx"))
+  crop_data <- as.data.frame(read_excel(crop_file))
+  crop_data <- add_detrended_yield(crop_data)
+
+  all_countries <- sort(unique(crop_data$Country_ISO))
+
+  crop_results <- list()
+  row_i <- 1
+
+  for (target in all_countries) {
+    remaining <- setdiff(all_countries, target)
+
+    for (N in source_sizes) {
+      if (N > length(remaining)) next
+
+      for (r in 1:n_replicates) {
+        # EXACT SAME seed formula as step4_FULL_climate_gdp.R
+        set.seed(10000 * which(all_countries == target) + 100 * N + r)
+        source_set <- sample(remaining, size = N, replace = FALSE)
+
+        prep <- prepare_train_test(source_set, target, crop_data)
+        if (nrow(prep$train) < 10 || nrow(prep$test) < 1) next
+
+        scaled <- standardize_with_train_stats(prep$train, prep$test, predictor_cols)
+
+        for (model_name in names(model_fns)) {
+          fn <- model_fns[[model_name]]
+          preds <- tryCatch(fn(scaled$train, scaled$test), error = function(e) NA)
+
+          if (!all(is.na(preds))) {
+            m <- compute_metrics(preds, scaled$test[[target_col]])
+            crop_results[[row_i]] <- data.frame(
+              crop = crop_name, target_country = target, N = N, replicate_id = r,
+              model = model_name, rmse = m$rmse, mae = m$mae,
+              n_train = nrow(prep$train), n_test = nrow(prep$test)
+            )
+          } else {
+            crop_results[[row_i]] <- data.frame(
+              crop = crop_name, target_country = target, N = N, replicate_id = r,
+              model = model_name, rmse = NA, mae = NA,
+              n_train = nrow(prep$train), n_test = nrow(prep$test)
+            )
+          }
+          row_i <- row_i + 1
+        }
+      }
+    }
+  }
+
+  crop_df <- do.call(rbind, crop_results)
+  crop_elapsed <- as.numeric(difftime(Sys.time(), crop_start, units = "mins"))
+
+  ckpt_file <- file.path(checkpoint_dir, paste0(crop_name, "_done.csv"))
+  write.csv(crop_df, ckpt_file, row.names = FALSE)
+
+  cat("CROP", crop_name, "DONE. Rows:", nrow(crop_df),
+      "| Time:", round(crop_elapsed, 1), "min | Saved to:", ckpt_file, "\n")
+
+  total_elapsed_hours <- as.numeric(difftime(Sys.time(), overall_start, units = "hours"))
+  cat("Cumulative elapsed time so far:", round(total_elapsed_hours, 2), "hours\n")
+
+  if (crop_name == crops_to_run[1]) {
+    projected_total_hours <- total_elapsed_hours * length(crops_to_run)
+    cat("\n>>> PROJECTION based on this first crop's actual time:\n")
+    cat(">>> Estimated TOTAL time for all", length(crops_to_run), "remaining crops:",
+        round(projected_total_hours, 1), "hours\n\n")
+  }
+}
+
+# ------------------------------------------------------------
+# COMBINE ALL CHECKPOINTS
+# ------------------------------------------------------------
+cat("\n\n==== COMBINING ALL CROP CHECKPOINTS ====\n")
+all_ckpt_files <- list.files(checkpoint_dir, pattern = "_done\\.csv$", full.names = TRUE)
+combined_list <- lapply(all_ckpt_files, read.csv)
+final_results <- do.call(rbind, combined_list)
+
+final_path <- file.path(output_dir, "step13_FULL_detrended_results.csv")
+write.csv(final_results, final_path, row.names = FALSE)
+
+cat("Total rows in final combined result:", nrow(final_results), "\n")
+cat("Saved final combined result to:", final_path, "\n")
+
+total_elapsed_hours <- as.numeric(difftime(Sys.time(), overall_start, units = "hours"))
+cat("\nTOTAL RUN TIME:", round(total_elapsed_hours, 2), "hours\n")
+
+# --- Compare N=5 vs N=60 reduction, detrended vs raw (already known) ---
+cat("\n==== Pooled median RMSE by N (detrended yield) ====\n")
+final_valid <- final_results[!is.na(final_results$rmse), ]
+by_n <- aggregate(rmse ~ N, data = final_valid, FUN = median)
+print(by_n)
+
+pct_reduction <- 100 * (by_n$rmse[by_n$N==5] - by_n$rmse[by_n$N==60]) / by_n$rmse[by_n$N==5]
+cat("\nDetrended pooled reduction N=5->60:", round(pct_reduction, 1), "%\n")
+cat("(Compare to raw-yield pooled reduction: 26.4%, from step4_FULL_climate_gdp_results.csv)\n")
 
 
 
